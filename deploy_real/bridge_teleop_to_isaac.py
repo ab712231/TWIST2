@@ -157,7 +157,9 @@ def main():
     try:
         while True:
             t0 = time.monotonic()
-            smplx_data, lhand, rhand, controller_data, headset_data = streamer.get_current_frame()
+            # lhand/rhand from the frame are (is_active, GMR-frame dict) -- unused;
+            # fingers are read straight from xrt below (raw Pico-frame arrays).
+            smplx_data, _lhand, _rhand, _controller, _headset = streamer.get_current_frame()
 
             upper_body = None
             if smplx_data is not None:
@@ -165,9 +167,18 @@ def main():
                 left_arm = np.asarray(qpos)[left_arm_idx].astype(np.float32)
                 right_arm = np.asarray(qpos)[right_arm_idx].astype(np.float32)
 
-                if finger_tracker is not None:
-                    lc = finger_tracker.pico_to_inspire_angles(lhand, "left")
-                    rc = finger_tracker.pico_to_inspire_angles(rhand, "right")
+                # Fingers: read the RAW Pico hand-tracking arrays straight from xrt
+                # (27x7 = [x,y,z, quat]) -- exactly what pico_to_inspire_angles /
+                # _extract_positions were written for, in the raw Pico frame. The
+                # streamer's lhand/rhand are (is_active, joint->pose dict) in the
+                # coordinate-transformed GMR frame, which the finger tracker cannot
+                # consume (np.array on a dict -> TypeError). curl is frame-invariant,
+                # so the raw Pico-frame positions are the correct input.
+                if finger_tracker is not None and xrt is not None:
+                    lc = finger_tracker.pico_to_inspire_angles(
+                        xrt.get_left_hand_tracking_state(), "left")
+                    rc = finger_tracker.pico_to_inspire_angles(
+                        xrt.get_right_hand_tracking_state(), "right")
                     if lc is not None:
                         left_hand = curl_to_rad(lc)
                     if rc is not None:
