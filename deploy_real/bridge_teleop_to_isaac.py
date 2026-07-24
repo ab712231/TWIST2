@@ -121,6 +121,8 @@ def main():
     ap.add_argument("--neck-scale", type=float, default=1.0)
     ap.add_argument("--rate-hz", type=float, default=30.0)
     ap.add_argument("--no-fingers", action="store_true", help="Hold hands open")
+    ap.add_argument("--debug-fingers", action="store_true",
+                    help="Print hand-tracking state + curl once/sec to diagnose fingers")
     args = ap.parse_args()
 
     # ── GMR retargeting + body/hand streamer (TWIST2's proven front-end) ──
@@ -175,10 +177,23 @@ def main():
                 # consume (np.array on a dict -> TypeError). curl is frame-invariant,
                 # so the raw Pico-frame positions are the correct input.
                 if finger_tracker is not None and xrt is not None:
-                    lc = finger_tracker.pico_to_inspire_angles(
-                        xrt.get_left_hand_tracking_state(), "left")
-                    rc = finger_tracker.pico_to_inspire_angles(
-                        xrt.get_right_hand_tracking_state(), "right")
+                    l_state = xrt.get_left_hand_tracking_state()
+                    r_state = xrt.get_right_hand_tracking_state()
+                    lc = finger_tracker.pico_to_inspire_angles(l_state, "left")
+                    rc = finger_tracker.pico_to_inspire_angles(r_state, "right")
+                    if args.debug_fingers and frames % max(int(args.rate_hz), 1) == 0:
+                        def _summ(s):
+                            a = np.asarray(s, dtype=object) if s is not None else None
+                            if a is None:
+                                return "None"
+                            af = np.asarray(s, dtype=np.float64)
+                            return f"shape={af.shape} nonzero={int(np.count_nonzero(np.abs(af) > 1e-6))}"
+                        print(f"\n[fingers] L active={xrt.get_left_hand_is_active()} "
+                              f"raw={_summ(l_state)} "
+                              f"curl={'None' if lc is None else np.round(lc, 1)}")
+                        print(f"[fingers] R active={xrt.get_right_hand_is_active()} "
+                              f"raw={_summ(r_state)} "
+                              f"curl={'None' if rc is None else np.round(rc, 1)}")
                     if lc is not None:
                         left_hand = curl_to_rad(lc)
                     if rc is not None:
@@ -205,7 +220,10 @@ def main():
                         if neck_yaw0 is None:
                             neck_yaw0, neck_pitch0 = float(az), float(el)
                         pan = _wrap(float(az) - neck_yaw0) * args.neck_scale
-                        tilt = _wrap(float(el) - neck_pitch0) * args.neck_scale
+                        # tilt NEGATED: the forward-vector elevation is inverted vs the
+                        # sim's neck tilt convention (head up -> neck down otherwise).
+                        # Verified regression; see memory pico-neck-decoupled-forward-vector.
+                        tilt = -_wrap(float(el) - neck_pitch0) * args.neck_scale
                         neck = [float(np.clip(pan, -3.2, 3.2)),
                                 float(np.clip(tilt, -1.6, 1.6))]
                 except Exception:
