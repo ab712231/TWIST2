@@ -177,6 +177,8 @@ def main():
                 # consume (np.array on a dict -> TypeError). curl is frame-invariant,
                 # so the raw Pico-frame positions are the correct input.
                 if finger_tracker is not None and xrt is not None:
+                    l_active = bool(xrt.get_left_hand_is_active())
+                    r_active = bool(xrt.get_right_hand_is_active())
                     l_state = xrt.get_left_hand_tracking_state()
                     r_state = xrt.get_right_hand_tracking_state()
                     lc = finger_tracker.pico_to_inspire_angles(l_state, "left")
@@ -194,9 +196,12 @@ def main():
                         print(f"[fingers] R active={xrt.get_right_hand_is_active()} "
                               f"raw={_summ(r_state)} "
                               f"curl={'None' if rc is None else np.round(rc, 1)}")
-                    if lc is not None:
+                    # Only apply when the hand is ACTIVELY tracked. When active=0 the
+                    # PICO keeps emitting the last-known (stale) pose, which otherwise
+                    # pins the fingers to a frozen curl. Inactive -> hold last command.
+                    if l_active and lc is not None:
                         left_hand = curl_to_rad(lc)
-                    if rc is not None:
+                    if r_active and rc is not None:
                         right_hand = curl_to_rad(rc)
 
                 upper_body = np.concatenate(
