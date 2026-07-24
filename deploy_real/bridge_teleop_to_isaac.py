@@ -33,15 +33,30 @@ import mujoco as mj
 import numpy as np
 import zmq
 
+from scipy.spatial.transform import Rotation
+
 from general_motion_retargeting import (
     ROBOT_XML_DICT,
     XRobotStreamer,
-    human_head_to_robot_neck,
 )
 from general_motion_retargeting import GeneralMotionRetargeting as GMR
 from data_utils.finger_tracking import PicoFingerTracker
 
+try:
+    import xrobotoolkit_sdk as xrt
+except ImportError:
+    xrt = None
+
 ROBOT = "unitree_g1"
+
+# Head orientation -> robot z-up frame (same as the relay / pico_streamer). Used
+# for the tuned forward-vector neck below.
+R_HEADSET_TO_WORLD = np.array([[0, 0, -1], [-1, 0, 0], [0, 1, 0]])
+
+
+def _wrap(a):
+    """Wrap an angle to [-pi, pi]."""
+    return (a + np.pi) % (2 * np.pi) - np.pi
 
 # Arm joints in the sim's target_upper_body_pose order (per side).
 ARM_SUFFIXES = [
@@ -128,8 +143,15 @@ def main():
     sock.bind(f"tcp://*:{args.isaac_port}")
     print(f"[bridge] publishing target_upper_body_pose -> bound tcp://*:{args.isaac_port}")
 
+    if xrt is None:
+        print("[bridge] WARNING: xrobotoolkit_sdk not importable -- head tracking "
+              "(neck) disabled; arms/fingers still work.")
+
     left_hand = HAND_OPEN.copy()
     right_hand = HAND_OPEN.copy()
+    # Forward-vector neck recenter baseline (captured on first valid head pose).
+    neck_yaw0 = None
+    neck_pitch0 = None
     dt = 1.0 / max(args.rate_hz, 1.0)
     frames, t_report = 0, time.monotonic()
     try:
@@ -154,18 +176,36 @@ def main():
                 upper_body = np.concatenate(
                     [left_arm, left_hand, right_arm, right_hand]).astype(np.float32)
 
-            # Neck from the head pose (TWIST2's mapping).
+            # Neck: reuse the relay's TUNED forward-vector head tracking -- decoupled
+            # (gimbal-safe) and verified correct in this sim -- rather than TWIST2's
+            # neck mapping. Azimuth/elevation of the head forward vector, recentered
+            # on the first valid pose. (This is the exact math shipped in the relay.)
             neck = [0.0, 0.0]
-            if smplx_data is not None:
+            if xrt is not None:
                 try:
-                    ny, npi = human_head_to_robot_neck(smplx_data)
-                    neck = [float(ny) * args.neck_scale, float(npi) * args.neck_scale]
+                    hq = np.array(xrt.get_headset_pose())[3:]  # x, y, z, w
+                    if not np.allclose(hq, 0):
+                        hr = (R_HEADSET_TO_WORLD
+                              @ Rotation.from_quat(hq).as_matrix()
+                              @ R_HEADSET_TO_WORLD.T)
+                        fwd = hr[:, 0]
+                        az = np.arctan2(fwd[1], fwd[0])
+                        el = np.arctan2(fwd[2], np.hypot(fwd[0], fwd[1]))
+                        if neck_yaw0 is None:
+                            neck_yaw0, neck_pitch0 = float(az), float(el)
+                        pan = _wrap(float(az) - neck_yaw0) * args.neck_scale
+                        tilt = _wrap(float(el) - neck_pitch0) * args.neck_scale
+                        neck = [float(np.clip(pan, -3.2, 3.2)),
+                                float(np.clip(tilt, -1.6, 1.6))]
                 except Exception:
                     neck = [0.0, 0.0]
 
+            # Always publish neck (head tracking is independent of body tracking,
+            # like the relay); include the arms/fingers when body data is present.
+            msg = {"neck_target": neck}
             if upper_body is not None:
-                msg = {"target_upper_body_pose": upper_body, "neck_target": neck}
-                sock.send(msgpack.packb(msg, default=mnp.encode), zmq.NOBLOCK)
+                msg["target_upper_body_pose"] = upper_body
+            sock.send(msgpack.packb(msg, default=mnp.encode), zmq.NOBLOCK)
 
             frames += 1
             now = time.monotonic()
