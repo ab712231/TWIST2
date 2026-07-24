@@ -111,6 +111,24 @@ def curl_to_rad(pico_angles):
     return HAND_OPEN + curl * (HAND_CLOSED - HAND_OPEN)
 
 
+def _align_hand_state(state):
+    """Align xrt's 26-joint hand array to finger_tracking's joint indices.
+
+    xrt.get_*_hand_tracking_state() returns 26 rows already indexed
+    [0=Wrist, 1=Palm, 2-5=Thumb, 6-10=Index, ... 21-25=Little], which matches
+    FINGER_JOINTS/THUMB_JOINTS (indices 2-25) as-is. But _extract_positions treats
+    a 26-row input as "no Palm" and PREPENDS a row, shifting every joint +1 and
+    breaking the curl indices. Pad to 27 rows (append at the end) so it takes the
+    (27,7) "use as-is" branch instead, keeping indices 2-25 aligned.
+    """
+    if state is None:
+        return None
+    a = np.asarray(state, dtype=np.float64)
+    if a.ndim == 2 and a.shape[0] == 26:
+        a = np.vstack([a, np.zeros((1, a.shape[1]))])
+    return a
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -179,8 +197,8 @@ def main():
                 if finger_tracker is not None and xrt is not None:
                     l_active = bool(xrt.get_left_hand_is_active())
                     r_active = bool(xrt.get_right_hand_is_active())
-                    l_state = xrt.get_left_hand_tracking_state()
-                    r_state = xrt.get_right_hand_tracking_state()
+                    l_state = _align_hand_state(xrt.get_left_hand_tracking_state())
+                    r_state = _align_hand_state(xrt.get_right_hand_tracking_state())
                     lc = finger_tracker.pico_to_inspire_angles(l_state, "left")
                     rc = finger_tracker.pico_to_inspire_angles(r_state, "right")
                     if args.debug_fingers and frames % max(int(args.rate_hz), 1) == 0:
