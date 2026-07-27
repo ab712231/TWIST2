@@ -18,7 +18,7 @@ over ZMQ, so the env split is fine.
   conda activate gmr
   cd ~/teleop/TWIST2/deploy_real
   python bridge_teleop_to_isaac.py --isaac-host localhost --isaac-port 5558 \
-      --actual-human-height 1.6
+      --actual-human-height 1.55
 
 Activation: this streams continuously; the sim applies whatever it receives. Use
 the sim/relay's usual start when you want the robot to follow (or just watch it
@@ -129,6 +129,108 @@ def _align_hand_state(state):
     return a
 
 
+class _FreshnessMonitor:
+    """Detect a hand whose pose feed is frozen despite is_active reporting 1.
+
+    The PICO reports is_active=1 for a hand it is not actually tracking and hands
+    back a constant, plausible rest pose (all curls 0, thumb rotation ~130). That
+    pose is indistinguishable from a genuine open hand by value alone, so it gets
+    applied and pins the fingers wide open. Live tracking always jitters at float
+    precision, so bit-identical consecutive frames mean the feed is dead.
+    """
+
+    def __init__(self, stale_frames):
+        self._stale_frames = max(int(stale_frames), 3)
+        self._prev = {}
+        self._count = {}
+
+    def is_live(self, side, state):
+        prev = self._prev.get(side)
+        self._prev[side] = None if state is None else np.array(state, copy=True)
+        if state is None:
+            self._count[side] = 0
+            return False
+        if prev is None or prev.shape != np.asarray(state).shape:
+            self._count[side] = 0
+            return True
+        if np.array_equal(prev, state):
+            self._count[side] = self._count.get(side, 0) + 1
+        else:
+            self._count[side] = 0
+        return self._count[side] < self._stale_frames
+
+    def frozen_for(self, side):
+        """Frames this hand has been repeating the same pose (0 = live)."""
+        return self._count.get(side, 0)
+
+
+class _ThumbCalibrator:
+    """Stretch the thumb channels to full range using the extremes seen so far.
+
+    Measured off the wire, the thumb channels never use their nominal 0..1000
+    span. Rotation runs ~65..740, so the thumb stops ~30% short of full
+    opposition and never quite crosses the palm; bend reaches 1000 on the right
+    hand but only ~800 on the left, so the same gesture gives visibly different
+    curl per side. The four finger channels do not need this -- they already
+    track their commands exactly.
+
+    Rescaling per hand from the observed range fixes both the short throw and the
+    left/right asymmetry, and adapts to whoever is wearing the headset instead of
+    baking in one operator's anatomy. Pass-through until the operator has actually
+    moved the thumb, so an unexercised channel is never amplified from noise.
+    """
+
+    SLOTS = (4, 5)      # thumb bend, thumb rotation
+    MIN_SPAN = 120.0    # of 1000; below this, treat the range as not yet known
+
+    # lo = median of a held fully-open pose (measured; the open hand tracks
+    # cleanly). hi = the achieved maximum from a full-range sweep, trimmed 10% so
+    # a real full curl saturates instead of stopping just short.
+    #
+    # lo is NOT taken from a session minimum: closing the fist occludes the thumb
+    # from the headset cameras, tracking drops out, and the dropout value (bend 0
+    # / rotation ~130) is far below any real open pose. Seeding lo from a min let
+    # one such frame define the floor, which left the thumb visibly curled at full
+    # extension. Held-median endpoints cannot be moved by a few bad frames.
+    SEED = {
+        ("left",  4): (44.0, 722.0),    ("right", 4): (141.0, 900.0),
+        ("left",  5): (159.0, 644.0),   ("right", 5): (207.0, 668.0),
+    }
+
+    def __init__(self, seed=True, adapt=False):
+        self._lo = {}
+        self._hi = {}
+        self._adapt = adapt
+        if seed:
+            for key, (lo, hi) in self.SEED.items():
+                self._lo[key], self._hi[key] = lo, hi
+
+    def apply(self, side, curl):
+        if curl is None:
+            return None
+        out = np.array(curl, dtype=np.float32, copy=True)
+        for s in self.SLOTS:
+            key = (side, s)
+            v = float(out[s])
+            # Only track extremes for an unseeded channel, or when explicitly
+            # adapting. Latching onto a running min is what corrupted the floor:
+            # a single tracking dropout during a closed fist sets it far below any
+            # real open pose, and it never recovers because bounds never shrink.
+            if key not in self._lo or self._adapt:
+                self._lo[key] = v if key not in self._lo else min(self._lo[key], v)
+                self._hi[key] = v if key not in self._hi else max(self._hi[key], v)
+            lo, hi = self._lo[key], self._hi[key]
+            if hi - lo >= self.MIN_SPAN:
+                out[s] = float(np.clip((v - lo) / (hi - lo) * 1000.0, 0.0, 1000.0))
+        return out
+
+    def span(self, side, slot):
+        key = (side, slot)
+        if key not in self._lo:
+            return 0.0
+        return self._hi[key] - self._lo[key]
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -139,6 +241,16 @@ def main():
     ap.add_argument("--neck-scale", type=float, default=1.0)
     ap.add_argument("--rate-hz", type=float, default=30.0)
     ap.add_argument("--no-fingers", action="store_true", help="Hold hands open")
+    ap.add_argument("--no-thumb-cal", action="store_true",
+                    help="Disable per-hand thumb auto-calibration. The raw thumb "
+                         "channels only cover ~65..740 of 1000 on rotation (thumb "
+                         "never fully opposes) and differ left vs right, so this "
+                         "rescales each to full travel from the observed range.")
+    ap.add_argument("--thumb-cal-adapt", action="store_true",
+                    help="Let the thumb range widen from observed extremes. Off by "
+                         "default: a tracking dropout during a closed fist reads far "
+                         "below any real open pose and would permanently drag the "
+                         "floor down. Use only when calibrating a new operator.")
     ap.add_argument("--debug-fingers", action="store_true",
                     help="Print hand-tracking state + curl once/sec to diagnose fingers")
     args = ap.parse_args()
@@ -149,6 +261,9 @@ def main():
                    actual_human_height=args.actual_human_height)
     streamer = XRobotStreamer()
     finger_tracker = None if args.no_fingers else PicoFingerTracker()
+    # ~0.4 s of bit-identical pose data => that hand is not really being tracked.
+    freshness = _FreshnessMonitor(stale_frames=args.rate_hz * 0.4)
+    thumb_cal = None if args.no_thumb_cal else _ThumbCalibrator(adapt=args.thumb_cal_adapt)
 
     model = mj.MjModel.from_xml_path(str(ROBOT_XML_DICT[ROBOT]))
     left_arm_idx, right_arm_idx = build_arm_qpos_index(model)
@@ -201,6 +316,11 @@ def main():
                     r_state = _align_hand_state(xrt.get_right_hand_tracking_state())
                     lc = finger_tracker.pico_to_inspire_angles(l_state, "left")
                     rc = finger_tracker.pico_to_inspire_angles(r_state, "right")
+                    l_live = freshness.is_live("left", l_state)
+                    r_live = freshness.is_live("right", r_state)
+                    if thumb_cal is not None:
+                        lc = thumb_cal.apply("left", lc)
+                        rc = thumb_cal.apply("right", rc)
                     if args.debug_fingers and frames % max(int(args.rate_hz), 1) == 0:
                         def _summ(s):
                             a = np.asarray(s, dtype=object) if s is not None else None
@@ -208,18 +328,27 @@ def main():
                                 return "None"
                             af = np.asarray(s, dtype=np.float64)
                             return f"shape={af.shape} nonzero={int(np.count_nonzero(np.abs(af) > 1e-6))}"
-                        print(f"\n[fingers] L active={xrt.get_left_hand_is_active()} "
+                        def _live(is_live, side):
+                            return "LIVE" if is_live else \
+                                f"FROZEN({freshness.frozen_for(side)} identical frames)"
+                        print(f"\n[fingers] L active={l_active} {_live(l_live, 'left')} "
                               f"raw={_summ(l_state)} "
                               f"curl={'None' if lc is None else np.round(lc, 1)}")
-                        print(f"[fingers] R active={xrt.get_right_hand_is_active()} "
+                        print(f"[fingers] R active={r_active} {_live(r_live, 'right')} "
                               f"raw={_summ(r_state)} "
                               f"curl={'None' if rc is None else np.round(rc, 1)}")
-                    # Only apply when the hand is ACTIVELY tracked. When active=0 the
-                    # PICO keeps emitting the last-known (stale) pose, which otherwise
-                    # pins the fingers to a frozen curl. Inactive -> hold last command.
-                    if l_active and lc is not None:
+                        if thumb_cal is not None:
+                            print(f"[thumbcal] learned span (need >{_ThumbCalibrator.MIN_SPAN:.0f}) "
+                                  f"L bend={thumb_cal.span('left', 4):.0f} rot={thumb_cal.span('left', 5):.0f}  "
+                                  f"R bend={thumb_cal.span('right', 4):.0f} rot={thumb_cal.span('right', 5):.0f}")
+                    # Only apply when the hand is actively tracked AND its pose feed is
+                    # actually changing. is_active alone is not enough: the PICO reports
+                    # active=1 for an untracked hand and returns a constant rest pose,
+                    # which reads as a legitimate "open hand" and pins the fingers open.
+                    # Not live -> hold the last commanded curl instead of overwriting it.
+                    if l_active and l_live and lc is not None:
                         left_hand = curl_to_rad(lc)
-                    if r_active and rc is not None:
+                    if r_active and r_live and rc is not None:
                         right_hand = curl_to_rad(rc)
 
                 upper_body = np.concatenate(
