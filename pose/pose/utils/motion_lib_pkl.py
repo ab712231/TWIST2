@@ -15,9 +15,17 @@ class FakeModule(ModuleType):
         if real:
             self.__dict__.update(real.__dict__)
 
-# Patch potentially missing modules
-sys.modules['numpy._core'] = FakeModule('numpy._core', np.core if hasattr(np, 'core') else np)
-sys.modules['numpy._core.multiarray'] = FakeModule('numpy._core.multiarray', getattr(np.core, 'multiarray', None))
+# Patch potentially missing modules.
+# Only on numpy 1.x, which has no numpy._core -- the fakes let it unpickle files
+# written by numpy 2.x. On numpy 2.x numpy._core is real and lazily imports its
+# own submodules, so overwriting it strands them: `import numpy.strings` raises
+# ModuleNotFoundError('numpy._core.strings') and numpy.core.defchararray's
+# __getattr__ resolves back onto itself and recurses until the stack blows.
+try:
+    import numpy._core  # noqa: F401
+except ImportError:
+    sys.modules['numpy._core'] = FakeModule('numpy._core', np.core if hasattr(np, 'core') else np)
+    sys.modules['numpy._core.multiarray'] = FakeModule('numpy._core.multiarray', getattr(np.core, 'multiarray', None))
 
 
 def smooth(x, box_pts, device):
