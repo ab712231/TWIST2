@@ -35,6 +35,9 @@ import mujoco as mj
 import mujoco.viewer as mjv
 import numpy as np
 import redis
+import xrobotoolkit_sdk as xrt
+
+from data_utils.pico_overlays import CorrectedFingerTracker, NeckForwardVector
 from data_utils.finger_tracking import PicoFingerTracker
 from data_utils.fps_monitor import FPSMonitor
 from data_utils.params import DEFAULT_HAND_POSE, DEFAULT_MIMIC_OBS
@@ -506,6 +509,12 @@ class XRobotTeleopToRobot:
             hand_type=self.hand_type,
             grip_thumb=args.grip_thumb,
         )
+        # Operator's tuned overlays, read straight from xrt (bypasses the streamer's
+        # (is_active, dict) hand tuple): corrected finger pipeline + forward-vector neck.
+        self._corrected_fingers = (
+            CorrectedFingerTracker(rate_hz=args.target_fps)
+            if self.use_finger_tracking else None)
+        self._neck_fv = NeckForwardVector(neck_scale=args.neck_retarget_scale)
         self.rate = None
         
         # Video recording
@@ -734,11 +743,15 @@ class XRobotTeleopToRobot:
             else:
                 return [0.0, 0.0]
             
-        # In teleop state, extract neck data from smplx_data
-        elif current_state == "teleop" and smplx_data is not None:
-            scale = self.args.neck_retarget_scale
-            neck_yaw, neck_pitch = human_head_to_robot_neck(smplx_data)
-            return [neck_yaw * scale, neck_pitch * scale]
+        # In teleop state, use the operator's tuned forward-vector head tracking
+        # (gimbal-safe, tilt negated), read straight from the headset -- independent
+        # of body data. Replaces human_head_to_robot_neck.
+        elif current_state == "teleop":
+            try:
+                hq = np.asarray(xrt.get_headset_pose())[3:]  # x, y, z, w
+                return self._neck_fv.compute(hq)
+            except Exception:
+                return [0.0, 0.0]
         
         # Default fallback
         return [0.0, 0.0]
@@ -941,7 +954,15 @@ class XRobotTeleopToRobot:
                 
                 # Update hand poses from finger tracking
                 if self.use_finger_tracking and self.state_machine.is_teleop_active():
-                    self.state_machine.update_hand_from_tracking(left_hand_data, right_hand_data)
+                    # Operator's corrected finger pipeline: xrt-direct read, joint
+                    # align, freshness gate, thumb calibration -> 0..1000 curl, or None
+                    # to HOLD the last curl on a frozen/untracked hand. Replaces the
+                    # streamer-dict path (which crashed on the (is_active, dict) tuple).
+                    lc, rc = self._corrected_fingers.get_curls(xrt)
+                    if lc is not None:
+                        self.state_machine._tracked_left_hand_pose = np.asarray(lc, dtype=np.float32)
+                    if rc is not None:
+                        self.state_machine._tracked_right_hand_pose = np.asarray(rc, dtype=np.float32)
                 
                 # Check if we should exit
                 if self.state_machine.should_exit():
