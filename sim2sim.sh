@@ -17,6 +17,10 @@ eval "$(conda shell.bash hook 2>/dev/null)"
 conda activate isaac
 
 cd "$WBC_BRIDGE"
+# Put the repo root on the path so a freshly-added module (gr00t_wbc_bridge.
+# wholebody_policy) resolves even when the editable install's static module map is
+# stale -- otherwise: "No module named gr00t_wbc_bridge.wholebody_policy".
+export PYTHONPATH="$WBC_BRIDGE:${PYTHONPATH:-}"
 python scripts/run_isaac_wholebody_policy.py \
     --policy "${ckpt_path}" \
     --policy-frequency 100 \
