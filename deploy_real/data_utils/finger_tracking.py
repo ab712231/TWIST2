@@ -187,6 +187,99 @@ def _compute_thumb_rotation(positions):
     return rotation
 
 
+class _ThumbCalibrator:
+    """Rescale the two thumb slots so a real open/closed hand spans the full range.
+
+    The PICO's raw thumb values never reach 0 at full extension -- held-open medians
+    measured off the wire were 44 / 159 (left bend/rot) and 141 / 207 (right), out of
+    1000. Mapped straight through, the thumb keeps a visible curl no matter how far
+    you straighten it, and never quite closes either. The four fingers do not need
+    this; only the thumb slots do.
+
+    lo = median of a held fully-open pose (the open hand tracks cleanly).
+    hi = the achieved maximum from a full-range sweep, trimmed ~10% so a real full
+         curl saturates instead of stopping just short.
+
+    Bounds are FIXED by default. Auto-widening sounds appealing but only ever grows
+    the range, so a single dropout frame permanently drags the floor down and
+    reinstates the original bug -- enable it only when deliberately recalibrating.
+    """
+
+    SLOTS = (4, 5)      # thumb bend, thumb rotation
+    MIN_SPAN = 120.0
+
+    SEED = {
+        ("left",  4): (44.0, 722.0),    ("right", 4): (141.0, 900.0),
+        ("left",  5): (159.0, 644.0),   ("right", 5): (207.0, 668.0),
+    }
+
+    def __init__(self, seed=True, adapt=False):
+        self._lo = {}
+        self._hi = {}
+        self._adapt = adapt
+        if seed:
+            for key, (lo, hi) in self.SEED.items():
+                self._lo[key], self._hi[key] = lo, hi
+
+    def apply(self, side, curl):
+        if curl is None:
+            return None
+        out = np.array(curl, dtype=np.float32, copy=True)
+        for s in self.SLOTS:
+            key = (side, s)
+            v = float(out[s])
+            if key not in self._lo or self._adapt:
+                self._lo[key] = v if key not in self._lo else min(self._lo[key], v)
+                self._hi[key] = v if key not in self._hi else max(self._hi[key], v)
+            lo, hi = self._lo[key], self._hi[key]
+            if hi - lo >= self.MIN_SPAN:
+                out[s] = float(np.clip((v - lo) / (hi - lo) * 1000.0, 0.0, 1000.0))
+        return out
+
+    def span(self, side, slot):
+        key = (side, slot)
+        if key not in self._lo:
+            return 0.0
+        return self._hi[key] - self._lo[key]
+
+
+class _FreshnessMonitor:
+    """Detect a hand whose pose feed is frozen even though it reports as tracked.
+
+    get_*_hand_is_active() is a tracking-QUALITY field living inside the same
+    per-hand record as the pose, so when acquisition fails the whole record freezes
+    -- is_active included. The stale pose is a plausible-looking rest hand, so it
+    reads as a deliberate "open hand" and pins the fingers open instead of failing
+    loudly.
+
+    Detection is on the raw pose array: N identical consecutive frames means the
+    feed is dead, since real tracking always jitters at the millimetre level.
+    """
+
+    def __init__(self, stale_frames=12):
+        self._stale_frames = max(int(stale_frames), 3)
+        self._prev = {}
+        self._count = {}
+
+    def is_live(self, side, state):
+        prev = self._prev.get(side)
+        self._prev[side] = None if state is None else np.array(state, copy=True)
+        if state is None:
+            self._count[side] = 0
+            return False
+        if prev is None or prev.shape != np.asarray(state).shape:
+            self._count[side] = 0
+            return True
+        if np.array_equal(prev, state):
+            self._count[side] = self._count.get(side, 0) + 1
+        else:
+            self._count[side] = 0
+        return self._count[side] < self._stale_frames
+
+    def frozen_for(self, side):
+        return self._count.get(side, 0)
+
+
 class PicoFingerTracker:
     """Converts Pico 4 Ultra hand tracking data to Inspire hand commands.
     
@@ -197,10 +290,17 @@ class PicoFingerTracker:
         curl_deadzone: Minimum curl value below which output is 0 (reduces jitter at rest).
     """
     
-    def __init__(self, smoothing_alpha=0.3, curl_gain=1.5, curl_deadzone=0.05):
+    def __init__(self, smoothing_alpha=0.3, curl_gain=1.5, curl_deadzone=0.05,
+                 thumb_calibration=True, thumb_cal_adapt=False, stale_frames=12):
         self.smoothing_alpha = smoothing_alpha
         self.curl_gain = curl_gain
         self.curl_deadzone = curl_deadzone
+        # Thumb range correction + frozen-feed guard. Both were validated against
+        # the sim before being brought here; see the class docstrings.
+        self._thumb_cal = (_ThumbCalibrator(adapt=thumb_cal_adapt)
+                           if thumb_calibration else None)
+        self._freshness = _FreshnessMonitor(stale_frames=stale_frames)
+        self._warned_frozen = set()
         
         # EMA state per hand
         self._left_smoothed = None
@@ -283,6 +383,18 @@ class PicoFingerTracker:
               [pinky, ring, middle, index, thumb_bend, thumb_rotation]
             Returns None if hand data is invalid.
         """
+        # Frozen-feed guard: a dead feed repeats the same record forever and would
+        # otherwise read as a deliberately-held open hand. Returning None makes the
+        # caller keep the last good pose rather than snapping the hand open.
+        if not self._freshness.is_live(hand_side, hand_data):
+            if hand_side not in self._warned_frozen:
+                self._warned_frozen.add(hand_side)
+                print(f"[finger_tracking][WARN] {hand_side} hand feed frozen "
+                      f"({self._freshness.frozen_for(hand_side)} identical frames); "
+                      f"holding last pose. Re-acquire tracking to recover.")
+            return None
+        self._warned_frozen.discard(hand_side)
+
         positions = self._extract_positions(hand_data)
         if positions is None:
             return None
@@ -319,13 +431,18 @@ class PicoFingerTracker:
         
         # Clip to valid range
         result = np.clip(result, 0.0, 1000.0).astype(np.float32)
-        
+
+        # Thumb range correction last, so it operates on the smoothed signal.
+        if self._thumb_cal is not None:
+            result = self._thumb_cal.apply(hand_side, result)
+
         return result
     
     def reset(self):
         """Reset smoothing state (call on state transitions)."""
         self._left_smoothed = None
         self._right_smoothed = None
+        self._warned_frozen = set()
 
 
 # ---------------------------------------------------------------------------

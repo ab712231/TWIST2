@@ -10,9 +10,18 @@ The Inspire hand has 6 DOF per hand:
   Index 4: Thumb bend
   Index 5: Thumb rotation
 
-Commands use angle_set values in range [0, 1000]:
-  1000 = fully open
-  0 = fully closed
+TWO CONVENTIONS, reconciled inside this class:
+
+  * The RH56DFTP angle_set/angle_act REGISTERS use [0, 1000] with
+        1000 = fully open, 0 = fully closed
+  * Everything upstream (PicoFingerTracker, data_utils.params.DEFAULT_HAND_POSE,
+    and the sim's curl_to_rad) uses the opposite:
+        0 = fully open, 1000 = fully closed
+
+  This class is the single translation point: `ctrl_dual_hand` and
+  `get_hand_state` speak the UPSTREAM convention, and _to_hw/_from_hw flip it at
+  the register boundary. Pass invert_angles=False to disable if a future hand
+  reports the register convention directly.
 
 Network defaults (on Unitree G1 internal network):
   Left hand:  192.168.123.210:6000
@@ -129,7 +138,7 @@ DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
-                 port=6000, device_id=1, re_init=True):
+                 port=6000, device_id=1, re_init=True, invert_angles=True):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -194,6 +203,14 @@ class InspireHandController:
         self._state_lock = threading.Lock()
         self._cmd_lock = threading.Lock()
         self._stop_event = threading.Event()
+
+        # angle_set/angle_act register convention. Everything upstream of this class
+        # -- PicoFingerTracker, data_utils.params.DEFAULT_HAND_POSE, and the sim's
+        # curl_to_rad -- uses 0 = OPEN, 1000 = CLOSED. The physical RH56DFTP register
+        # is the other way round (1000 = fully open), so the two are reconciled HERE,
+        # at the single point where values meet the hardware, rather than inverting
+        # upstream and desyncing the sim path that was validated against it.
+        self._invert = bool(invert_angles)
 
         # Last-wins command buffer. Initialized to the default open pose so
         # the first write the worker sends matches _bootstrap_write_default_sync.
@@ -344,6 +361,18 @@ class InspireHandController:
         self.Ltemp = np.array(left_temp[:Inspire_Num_Motors], dtype=np.float32)
         self.Rtemp = np.array(right_temp[:Inspire_Num_Motors], dtype=np.float32)
 
+    def _to_hw(self, vals):
+        """Upstream (0=open) -> register (1000=open). Identity if inversion is off."""
+        if not self._invert:
+            return [int(np.clip(v, 0, 1000)) for v in vals]
+        return [int(np.clip(1000 - v, 0, 1000)) for v in vals]
+
+    def _from_hw(self, arr):
+        """Register (1000=open) -> upstream (0=open). Identity if inversion is off."""
+        if not self._invert:
+            return arr
+        return (1000.0 - np.asarray(arr, dtype=np.float32)).astype(np.float32)
+
     def _bootstrap_write_default_sync(self):
         """One-shot synchronous write of the default open pose to both hands.
 
@@ -351,8 +380,8 @@ class InspireHandController:
         only be called from the main thread when workers are not running.
         """
         print("Initializing Inspire hands with default open poses...")
-        left_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_LEFT]
-        right_angles = [int(np.clip(v, 0, 1000)) for v in DEFAULT_QPOS_RIGHT]
+        left_angles = self._to_hw(DEFAULT_QPOS_LEFT)
+        right_angles = self._to_hw(DEFAULT_QPOS_RIGHT)
         try:
             self.left_client.write_registers(REG_ANGLE_SET, left_angles, **self._dev_kwargs)
             self.right_client.write_registers(REG_ANGLE_SET, right_angles, **self._dev_kwargs)
@@ -429,7 +458,7 @@ class InspireHandController:
                 if target_to_write is not None:
                     try:
                         client.write_registers(
-                            REG_ANGLE_SET, target_to_write, **self._dev_kwargs)
+                            REG_ANGLE_SET, self._to_hw(target_to_write), **self._dev_kwargs)
                         self._note_ok(side)
                     except Exception as e:
                         self._note_error(side, f"write_registers: {e}")
@@ -438,7 +467,8 @@ class InspireHandController:
                 pos = None
                 try:
                     angles = self._read_registers_signed(client, REG_ANGLE_ACT, 6)
-                    pos = np.array(angles, dtype=np.float32)
+                    # back to upstream units so state_hand_* matches action_hand_*
+                    pos = self._from_hw(np.array(angles, dtype=np.float32))
                     self._note_ok(side)
                 except Exception as e:
                     self._note_error(side, f"read angle_act: {e}")

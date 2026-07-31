@@ -260,7 +260,11 @@ def main():
     retarget = GMR(src_human="xrobot", tgt_robot=ROBOT,
                    actual_human_height=args.actual_human_height)
     streamer = XRobotStreamer()
-    finger_tracker = None if args.no_fingers else PicoFingerTracker()
+    # thumb_calibration=False: this file owns its own _ThumbCalibrator below (with
+    # --no-thumb-cal / --thumb-cal-adapt). PicoFingerTracker now calibrates the thumb
+    # internally by default for the hardware path, so leaving it on here would apply
+    # the same rescale twice and stretch the mid-range of the tuned thumb travel.
+    finger_tracker = None if args.no_fingers else PicoFingerTracker(thumb_calibration=False)
     # ~0.4 s of bit-identical pose data => that hand is not really being tracked.
     freshness = _FreshnessMonitor(stale_frames=args.rate_hz * 0.4)
     thumb_cal = None if args.no_thumb_cal else _ThumbCalibrator(adapt=args.thumb_cal_adapt)

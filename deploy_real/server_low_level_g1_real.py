@@ -197,7 +197,12 @@ class RealTimePolicyController(object):
     def _init_redis_default_pose(self):
         """Write default pose to Redis so action keys are initialized."""
         default_body = DEFAULT_MIMIC_OBS["unitree_g1_with_hands"]
-        default_hand = np.full(self.hand_dof, 1000.0, dtype=np.float32)
+        # Upstream convention: 0 = OPEN (matches PicoFingerTracker and
+        # data_utils.params DEFAULT_HAND_POSE["...inspire"][side]["open"]).
+        # InspireHandController flips this to the register's 1000=open at the
+        # hardware boundary, so this must NOT be 1000 -- that would command a
+        # full clench the moment the control loop starts, before teleop connects.
+        default_hand = np.zeros(self.hand_dof, dtype=np.float32)
         default_neck = [0.0, 0.0]
 
         self.redis_pipeline.set("action_body_unitree_g1_with_hands", json.dumps(default_body.tolist()))

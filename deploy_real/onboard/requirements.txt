@@ -2,3 +2,5 @@ pyrealsense2
 pyzmq<27
 numpy
 opencv-python-headless
+dynamixel-sdk
+redis

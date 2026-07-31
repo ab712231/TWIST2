@@ -1,6 +1,6 @@
 
 
-source ~/miniconda3/bin/activate twist2_deploy
+source ~/miniconda3/bin/activate twist2
 
 SCRIPT_DIR=$(dirname $(realpath $0))
 ckpt_path=${SCRIPT_DIR}/assets/ckpts/twist2_1017_20k.onnx

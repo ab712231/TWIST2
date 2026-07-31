@@ -157,8 +157,14 @@ class CorrectedFingerTracker:
 
 
 class NeckForwardVector:
-    """Decoupled forward-vector head->neck (pan, tilt), recentered on first pose,
-    tilt negated. gimbal-safe (no Euler cross-coupling)."""
+    """Decoupled forward-vector head->neck (pan, tilt), recentered on first pose.
+    gimbal-safe (no Euler cross-coupling).
+
+    Sign convention matches GR00T-WBC-Bridge's run_teleop_inspire_relay.py, which is
+    the version validated against the physical Twist2 neck. Tilt is NOT negated here:
+    onboard_neck_driver.py applies the head->servo direction itself via --tilt-sign
+    (default -1). Negating in both places cancels out and drives the neck the wrong
+    way, which is what this producer used to do."""
 
     def __init__(self, neck_scale=1.0, pan_clip=3.2, tilt_clip=1.6):
         self.neck_scale = neck_scale
@@ -179,6 +185,6 @@ class NeckForwardVector:
         if self._yaw0 is None:
             self._yaw0, self._pitch0 = float(az), float(el)
         pan = _wrap(float(az) - self._yaw0) * self.neck_scale
-        tilt = -_wrap(float(el) - self._pitch0) * self.neck_scale
+        tilt = _wrap(float(el) - self._pitch0) * self.neck_scale
         return [float(np.clip(pan, -self.pan_clip, self.pan_clip)),
                 float(np.clip(tilt, -self.tilt_clip, self.tilt_clip))]
