@@ -291,7 +291,8 @@ class PicoFingerTracker:
     """
     
     def __init__(self, smoothing_alpha=0.3, curl_gain=1.5, curl_deadzone=0.05,
-                 thumb_calibration=True, thumb_cal_adapt=False, stale_frames=12):
+                 thumb_calibration=True, thumb_cal_adapt=False, stale_frames=12,
+                 freshness=True):
         self.smoothing_alpha = smoothing_alpha
         self.curl_gain = curl_gain
         self.curl_deadzone = curl_deadzone
@@ -299,7 +300,10 @@ class PicoFingerTracker:
         # the sim before being brought here; see the class docstrings.
         self._thumb_cal = (_ThumbCalibrator(adapt=thumb_cal_adapt)
                            if thumb_calibration else None)
-        self._freshness = _FreshnessMonitor(stale_frames=stale_frames)
+        # Callers that already run their own freshness gate (CorrectedFingerTracker)
+        # must disable this one: two gates with different thresholds means the
+        # stricter one silently wins and drops hands the caller would have kept.
+        self._freshness = _FreshnessMonitor(stale_frames=stale_frames) if freshness else None
         self._warned_frozen = set()
         
         # EMA state per hand
@@ -386,7 +390,7 @@ class PicoFingerTracker:
         # Frozen-feed guard: a dead feed repeats the same record forever and would
         # otherwise read as a deliberately-held open hand. Returning None makes the
         # caller keep the last good pose rather than snapping the hand open.
-        if not self._freshness.is_live(hand_side, hand_data):
+        if self._freshness is not None and not self._freshness.is_live(hand_side, hand_data):
             if hand_side not in self._warned_frozen:
                 self._warned_frozen.add(hand_side)
                 print(f"[finger_tracking][WARN] {hand_side} hand feed frozen "

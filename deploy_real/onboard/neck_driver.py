@@ -33,10 +33,14 @@ import argparse
 import sys
 import time
 
-import msgpack
-import msgpack_numpy as mnp
 import numpy as np
-import zmq
+
+# msgpack / msgpack_numpy / zmq are imported lazily inside the --source zmq
+# branch. They are only needed to decode the sim relay's goal dict; the real
+# deployment path (--source redis) never touches them. Importing them here made
+# the driver unrunnable on the G1 Orin, which has neither the packages nor
+# internet access to fetch them -- and msgpack ships C extensions, so it cannot
+# be satisfied by copying an x86 wheel across either.
 
 try:
     from dynamixel_sdk import (
@@ -471,6 +475,13 @@ def main():
         print(f"Reading neck_target from Redis '{args.neck_key}' @ "
               f"{args.redis_host}:{args.redis_port}. Ctrl-C to quit.")
     else:
+        try:
+            import msgpack
+            import msgpack_numpy as mnp
+            import zmq
+        except ImportError as e:
+            sys.exit(f"--source zmq needs msgpack, msgpack-numpy and pyzmq ({e}). "
+                     f"The real-robot path uses --source redis, which needs none of them.")
         ctx = zmq.Context()
         sub = ctx.socket(zmq.SUB)
         sub.setsockopt_string(zmq.SUBSCRIBE, "")
@@ -481,6 +492,8 @@ def main():
 
     dt = 1.0 / args.rate_hz
     last_rx = time.monotonic()
+    last_t_action = None
+    last_pub_change = time.monotonic()
     try:
         while True:
             t0 = time.monotonic()
@@ -494,8 +507,18 @@ def main():
                 try:
                     raw = rds.get(args.neck_key)
                     t_raw = rds.get("t_action")
-                    stale = (t_raw is not None and
-                             time.time() * 1000.0 - float(t_raw) > args.dropout_hold_s * 1000.0)
+                    # Liveness by CHANGE, not by absolute timestamp. t_action is
+                    # stamped on the publisher's clock; comparing it to ours needs
+                    # the two machines to agree, and the G1 Orin has no internet so
+                    # NTP never syncs it. A 38 s skew made every target look ancient
+                    # and the neck sat at home forever while everything else looked
+                    # healthy. All we actually need to know is whether the publisher
+                    # is still ticking -- so watch t_action advance against our own
+                    # monotonic clock.
+                    if t_raw is not None and t_raw != last_t_action:
+                        last_t_action = t_raw
+                        last_pub_change = time.monotonic()
+                    stale = (time.monotonic() - last_pub_change) > args.dropout_hold_s
                     if raw is not None and not stale:
                         neck = json.loads(raw)
                         if neck is not None and len(neck) >= 2:

@@ -103,6 +103,7 @@ class RealTimePolicyController(object):
                  net='eno1',
                  use_hand=False,
                  hand_type='dex3',
+                 tactile_every=1,
                  inspire_left_ip='192.168.123.210',
                  inspire_right_ip='192.168.123.211',
                  record_proprio=False,
@@ -126,6 +127,7 @@ class RealTimePolicyController(object):
                 self.hand_ctrl = InspireHandController(
                     left_ip=inspire_left_ip,
                     right_ip=inspire_right_ip,
+                    tactile_every=tactile_every,
                     re_init=False)
             else:
                 self.hand_ctrl = Dex3_1_Controller(net, re_init=False)
@@ -438,6 +440,16 @@ def main():
     parser.add_argument('--hand_type', type=str, default='dex3',
                         choices=['dex3', 'inspire'],
                         help='Type of dextrous hand (dex3 or inspire)')
+    parser.add_argument('--no_tactile', action='store_true',
+                        help='Disable Inspire tactile polling. The tactile block is 1062 '
+                             'registers/hand and takes ~40ms to read vs ~3ms for everything '
+                             'else, which drags the hand worker from 50Hz to ~19Hz -- and the '
+                             'worker also writes the finger commands, so this costs finger '
+                             'responsiveness. Use when tactile is not being recorded.')
+    parser.add_argument('--tactile_every', type=int, default=1,
+                        help='Poll tactile every Nth worker tick (1 = every tick). Lets you '
+                             'keep tactile at a lower rate instead of dropping it entirely. '
+                             'Ignored when --no_tactile is set.')
     parser.add_argument('--inspire_left_ip', type=str, default='192.168.123.210',
                         help='IP address of left Inspire hand')
     parser.add_argument('--inspire_right_ip', type=str, default='192.168.123.211',
@@ -491,6 +503,7 @@ def main():
         net=args.net,
         use_hand=args.use_hand,
         hand_type=args.hand_type,
+        tactile_every=(0 if args.no_tactile else max(args.tactile_every, 0)),
         inspire_left_ip=args.inspire_left_ip,
         inspire_right_ip=args.inspire_right_ip,
         record_proprio=args.record_proprio,

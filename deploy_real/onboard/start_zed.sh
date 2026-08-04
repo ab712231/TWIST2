@@ -25,9 +25,15 @@
 # it cannot be pip-installed. Install the JetPack-matching SDK from stereolabs.com
 # on the Orin, then run its get_python_api.py.
 
+# INTERPRETER: pin the system python -- it is the one carrying cv2 + pyzed.
+# Conda base has pyzed but NOT cv2, so a conda-activated shell breaks this.
+# (start_neck.sh pins the conda python for the mirror-image reason.)
+PYTHON="${PYTHON:-/usr/bin/python3}"
+[[ -x "$PYTHON" ]] || PYTHON=python3
+
 export ZED_SETTINGS_PATH="${ZED_SETTINGS_PATH:-$HOME/.zed_settings/}"
 
-python3 ~/g1-onboard/zed_streamer.py \
+"$PYTHON" ~/g1-onboard/zed_streamer.py \
     --port 5556 \
     --resolution HD720 \
     --fps 30 \

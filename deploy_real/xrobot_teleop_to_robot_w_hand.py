@@ -220,9 +220,17 @@ class StateMachine:
             # Each joystick controls its respective hand's thumb:
             #   X axis = thumb rotation, Y axis = thumb bend
             # --grip_thumb flag: grip button also controls thumb rotation
-            # Invert PICO input: trigger 1.0 (pressed) → position 0.0 (closed)
-            self.hand_right_finger_position = 1.0 - float(right_index_trig_current)
-            self.hand_left_finger_position = 1.0 - float(left_index_trig_current)
+            # Curl convention here is 0 = open, 1000 = closed -- the same one
+            # finger_tracking.py emits and DEFAULT_HAND_POSE encodes. The real
+            # RH56DFTP register is the opposite way round (1000 = stretched), and
+            # inspire_hand_wrapper flips it once at the register boundary
+            # (invert_angles=True). This used to be written `1.0 - trigger`, which
+            # was correct back when nothing inverted downstream; once the wrapper
+            # started flipping, that left the controller path inverted against the
+            # finger-tracking path. Emit the shared convention and let the wrapper
+            # own the hardware quirk.
+            self.hand_right_finger_position = float(right_index_trig_current)
+            self.hand_left_finger_position = float(left_index_trig_current)
 
             # Right joystick → right thumb
             right_axis = controller_data.get('RightController', {}).get('axis', [0.0, 0.0])
@@ -230,7 +238,9 @@ class StateMachine:
                 self.hand_right_thumb_bend_position = np.clip(0.5 - right_axis[1] * 0.5, 0.0, 1.0)
                 joystick_thumb_rot = np.clip(0.5 + right_axis[0] * 0.5, 0.0, 1.0)
                 if self.grip_thumb:
-                    self.hand_right_thumb_position = max(joystick_thumb_rot, 1.0 - float(right_grip_current))
+                    # Same 0=open convention as the trigger above: released grip
+                    # must contribute 0, not pin the thumb closed.
+                    self.hand_right_thumb_position = max(joystick_thumb_rot, float(right_grip_current))
                 else:
                     self.hand_right_thumb_position = joystick_thumb_rot
 
@@ -240,7 +250,7 @@ class StateMachine:
                 self.hand_left_thumb_bend_position = np.clip(0.5 - left_axis[1] * 0.5, 0.0, 1.0)
                 joystick_thumb_rot = np.clip(0.5 - left_axis[0] * 0.5, 0.0, 1.0)
                 if self.grip_thumb:
-                    self.hand_left_thumb_position = max(joystick_thumb_rot, 1.0 - float(left_grip_current))
+                    self.hand_left_thumb_position = max(joystick_thumb_rot, float(left_grip_current))
                 else:
                     self.hand_left_thumb_position = joystick_thumb_rot
         else:
@@ -368,8 +378,10 @@ class StateMachine:
             right_pose = self._tracked_right_hand_pose if self._tracked_right_hand_pose is not None else right_default
             return left_pose, right_pose
 
-        # Inspire RH56DFTP: 1000 = open, 0 = closed
-        # trigger pressed (1.0) → close (0), released (0.0) → open (1000)
+        # Curl, 0 = open / 1000 = closed -- matching finger_tracking.py and
+        # DEFAULT_HAND_POSE. (The RH56DFTP *register* is inverted, 1000 = stretched;
+        # inspire_hand_wrapper flips it once, so nothing above here should.)
+        # trigger released (0.0) → open (0), pressed (1.0) → closed (1000)
         if self.hand_type == 'inspire':
             l_finger = self.hand_left_finger_position * 1000
             l_thumb = self.hand_left_thumb_position * 1000

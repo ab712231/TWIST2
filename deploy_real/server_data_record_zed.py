@@ -125,12 +125,59 @@ def main(args):
     prev_button_pressed = False
     prev_right_axis_click_pressed = False
 
+    # Liveness state for the controller feed (see the loop for why this exists).
+    CONTROLLER_STALE_S = 2.0
+    last_raw_controller = None
+    last_controller_change = time.monotonic()
+    controller_stale = False
+    warned_missing = False
+
     try:
         while running:
             start_time = time.time()
 
             # ---- Controller input ----
-            controller_data = json.loads(redis_client.get("controller_data"))
+            # Redis keys never expire (ttl -1), so a dead teleop leaves its LAST
+            # controller_data lying there forever and this loop happily reads it as
+            # if it were live. The buttons then do nothing -- the toggle below is
+            # rising-edge, so a value frozen either way never fires -- and it looks
+            # like a broken camera rather than a missing publisher. Worse, a session
+            # that ended with axis_click True would quit us instantly on startup.
+            # So gate on the payload actually CHANGING, on the monotonic clock (the
+            # robot's wall clock drifts seconds from the workstation's).
+            raw_controller = redis_client.get("controller_data")
+            if raw_controller is None:
+                if not warned_missing:
+                    print("[controller] no controller_data in Redis -- is teleop.sh running?", flush=True)
+                    warned_missing = True
+                time.sleep(0.1)
+                continue
+            warned_missing = False
+            if raw_controller != last_raw_controller:
+                last_raw_controller = raw_controller
+                last_controller_change = time.monotonic()
+                if controller_stale:
+                    controller_stale = False
+                    print("[controller] feed live again.", flush=True)
+            elif not controller_stale and time.monotonic() - last_controller_change > CONTROLLER_STALE_S:
+                controller_stale = True
+                # Distinguish the two causes, because they need opposite fixes and
+                # look identical from here. A live PICO stamps get_time_stamp_ns()
+                # into every frame, so timestamp == 0 means teleop IS publishing but
+                # the headset is not connected -- restarting teleop would not help.
+                try:
+                    ts = json.loads(raw_controller).get("timestamp", 0)
+                except Exception:
+                    ts = 0
+                if ts:
+                    why = "teleop.sh is not publishing -- is it still running?"
+                else:
+                    why = ("PICO not connected (timestamp=0) -- turn on the headset and "
+                           "open the XRoboToolkit app. teleop.sh itself is fine.")
+                print(f"[controller] FROZEN for {CONTROLLER_STALE_S:.0f}s -- buttons will not "
+                      f"respond. {why}", flush=True)
+
+            controller_data = json.loads(raw_controller)
             button_pressed = controller_data["LeftController"]["key_two"]
 
             quit_key = controller_data["LeftController"]["axis_click"]

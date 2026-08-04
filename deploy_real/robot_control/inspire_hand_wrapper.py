@@ -138,7 +138,8 @@ DEFAULT_QPOS_RIGHT = DEFAULT_HAND_POSE["unitree_g1_inspire"]["right"]["open"]
 
 class InspireHandController:
     def __init__(self, left_ip='192.168.123.210', right_ip='192.168.123.211',
-                 port=6000, device_id=1, re_init=True, invert_angles=True):
+                 port=6000, device_id=1, re_init=True, invert_angles=True,
+                 tactile_every=1):
         """
         Initialize Inspire hand controller via Modbus TCP.
 
@@ -211,6 +212,15 @@ class InspireHandController:
         # at the single point where values meet the hardware, rather than inverting
         # upstream and desyncing the sim path that was validated against it.
         self._invert = bool(invert_angles)
+
+        # Tactile polling cadence, in worker ticks. 0 disables it entirely.
+        # The tactile block is 1062 uint16 registers per hand and takes ~40 ms to
+        # read, against ~3 ms for angle/current/temperature combined. Since the
+        # worker also WRITES the finger command on each tick, polling tactile
+        # every tick drags the whole worker from 50 Hz down to ~19 Hz -- i.e. it
+        # costs finger responsiveness, not just telemetry freshness. Decimate or
+        # disable it when tactile isn't being recorded.
+        self._tactile_every = max(int(tactile_every), 0)
 
         # Last-wins command buffer. Initialized to the default open pose so
         # the first write the worker sends matches _bootstrap_write_default_sync.
@@ -438,6 +448,7 @@ class InspireHandController:
         is_left = (side == "left")
         period = self._worker_period_s
         next_tick = time.monotonic()
+        tick = 0
 
         while not self._stop_event.is_set():
             try:
@@ -497,11 +508,12 @@ class InspireHandController:
                 # main 50 Hz control loop is unaffected because it reads
                 # the cache, not the hardware.
                 tactile = None
-                try:
-                    prev = self.Ltactile if is_left else self.Rtactile
-                    tactile = self._read_tactile(client, prev)
-                except Exception as e:
-                    self._note_error(side, f"read tactile: {e}")
+                if self._tactile_every and (tick % self._tactile_every == 0):
+                    try:
+                        prev = self.Ltactile if is_left else self.Rtactile
+                        tactile = self._read_tactile(client, prev)
+                    except Exception as e:
+                        self._note_error(side, f"read tactile: {e}")
 
                 # --- 3. Commit cache under _state_lock ---
                 if (pos is not None or tau is not None
@@ -534,6 +546,7 @@ class InspireHandController:
                 print(f"[InspireHandWorker-{side[0].upper()}] unexpected error: {e}")
 
             # --- 4. Deadline sleep, cancellable by stop_event ---
+            tick += 1
             next_tick += period
             now = time.monotonic()
             remaining = next_tick - now

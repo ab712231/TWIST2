@@ -21,10 +21,19 @@
 # measured on the physical neck. Verify with --dry-run (prints ticks, moves
 # nothing) or --jog (arrow keys) after any mechanical rework.
 
+# INTERPRETER: the Orin has two pythons with a SPLIT dependency set --
+# /usr/bin/python3 (3.10) has cv2+pyzed but NOT dynamixel_sdk or redis;
+# ~/miniconda3/bin/python3 (3.13) has dynamixel_sdk+redis but not cv2.
+# A login shell puts /usr/bin/python3 first, so a bare `python3` here fails with
+# ModuleNotFoundError. Pin the conda one, which is the only one that can drive
+# the servos. (start_zed.sh pins the other for the same reason, inverted.)
+PYTHON="${PYTHON:-$HOME/miniconda3/bin/python3}"
+[[ -x "$PYTHON" ]] || PYTHON=python3
+
 REDIS_HOST="${REDIS_HOST:-192.168.123.222}"   # workstation on the robot network
 DEVICE="${DEVICE:-/dev/ttyUSB0}"
 
-python3 ~/g1-onboard/neck_driver.py \
+"$PYTHON" ~/g1-onboard/neck_driver.py \
     --source redis \
     --redis-host "${REDIS_HOST}" \
     --device "${DEVICE}" \

@@ -135,9 +135,14 @@ class CorrectedFingerTracker:
     """
 
     def __init__(self, rate_hz=30.0, thumb_cal=True, thumb_adapt=False):
-        self.tracker = PicoFingerTracker()
+        # thumb_calibration=False: this class owns the calibration and freshness
+        # gate below. PicoFingerTracker now applies both internally by default
+        # (for the hardware path in server_low_level_g1_real.py), so leaving them
+        # on here would rescale the thumb twice and gate the feed twice.
+        self.tracker = PicoFingerTracker(thumb_calibration=False, freshness=False)
         self.freshness = _FreshnessMonitor(stale_frames=rate_hz * 0.4)
         self.thumb_cal = _ThumbCalibrator(adapt=thumb_adapt) if thumb_cal else None
+        self._last_warn = {}
 
     def get_curls(self, xrt):
         out = {}
@@ -152,7 +157,23 @@ class CorrectedFingerTracker:
             live = self.freshness.is_live(side, state)
             if curl is not None and self.thumb_cal is not None:
                 curl = self.thumb_cal.apply(side, curl)
-            out[side] = curl if (active and live and curl is not None) else None
+            ok = active and live and curl is not None
+            out[side] = curl if ok else None
+            # A dropped hand is silent otherwise -- the caller just holds its last
+            # curl -- so say WHICH gate rejected it. Throttled to ~1 Hz per side.
+            if not ok:
+                import time as _t
+                last = self._last_warn.get(side, 0.0)
+                if _t.time() - last > 1.0:
+                    self._last_warn[side] = _t.time()
+                    why = []
+                    if not active:
+                        why.append("is_active=False (PICO not tracking this hand)")
+                    if not live:
+                        why.append(f"feed frozen ({self.freshness.frozen_for(side)} identical frames)")
+                    if curl is None:
+                        why.append("curl=None (invalid/zero joint data)")
+                    print(f"[fingers] {side} hand dropped: {'; '.join(why)}", flush=True)
         return out["left"], out["right"]
 
 

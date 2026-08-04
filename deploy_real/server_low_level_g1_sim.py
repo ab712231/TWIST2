@@ -231,6 +231,11 @@ class RealTimePolicyController:
         steps = int(self.sim_duration / self.sim_dt)
         pbar = tqdm(range(steps), desc="Simulating TWIST2...")
 
+        # Absolute wall-clock deadline for real-time pacing (see the limit_fps
+        # block at the bottom of the loop). Absolute rather than per-iteration so
+        # sleep overshoot cannot accumulate.
+        next_deadline = time.time()
+
         # Send initial proprio to redis
         initial_obs = np.zeros(self.n_obs_single, dtype=np.float32)
         self.redis_pipeline.set("state_body_unitree_g1_with_hands", json.dumps(initial_obs.tolist()))
@@ -409,11 +414,28 @@ class RealTimePolicyController:
                 self.data.ctrl[:] = torque
                 mujoco.mj_step(self.model, self.data)
                 
-                # Sleep to maintain real-time pace
+                # Real-time pacing.
+                #
+                # Sleeping every physics step does not work: sim_dt is 1 ms and
+                # time.sleep() has roughly 1 ms granularity on Linux, so every
+                # sleep overshoots. The loop lands at ~520 Hz physics / ~53 Hz
+                # policy instead of 1000/100, i.e. the policy runs at half the
+                # rate it was trained at. Turning the limiter off overshoots the
+                # other way (~190 Hz policy).
+                #
+                # So pace once per POLICY step -- a 10 ms budget, which sleep can
+                # hold accurately -- against an absolute deadline so overshoot
+                # doesn't accumulate.
                 if self.limit_fps:
-                    elapsed = time.time() - t_start
-                    if elapsed < self.sim_dt:
-                        time.sleep(self.sim_dt - elapsed)
+                    next_deadline += self.sim_dt
+                    if i % self.sim_decimation == 0:
+                        slack = next_deadline - time.time()
+                        if slack > 0:
+                            time.sleep(slack)
+                        elif slack < -0.05:
+                            # Fell badly behind (e.g. a stall); resync rather than
+                            # sprinting to catch up on stale deadlines.
+                            next_deadline = time.time()
 
                     
         except Exception as e:
